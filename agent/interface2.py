@@ -2,6 +2,7 @@ import os
 import asyncio
 import time
 import logging
+import json
 
 from dotenv import load_dotenv
 # LangChain: Chat-модель + базовые утилиты
@@ -10,12 +11,10 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 
 # Для подсчёта токенов (приблизительно)
-from transformers import GPT2TokenizerFast  # <-- Добавлено
+from transformers import GPT2TokenizerFast
 
-# Подгружаем .env, если нужно
 load_dotenv()
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -44,7 +43,6 @@ def log_and_time(func):
     return wrapper
 
 def init_project():
-    # Получаем ключ из переменной окружения GOOGLE_API_KEY
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logging.error("GOOGLE_API_KEY не установлен в переменных окружения.")
@@ -52,9 +50,14 @@ def init_project():
     return api_key
 
 class Memory:
+    """
+    Хранит все версии текстов и обратную связь.
+    versions: [(version_name, text), ...]
+    feedback: [(role, feedback_text), ...]
+    """
     def __init__(self):
-        self.versions = []  # Список (version_name, draft_text)
-        self.feedback = []  # Список (role, feedback_text)
+        self.versions = []
+        self.feedback = []
 
     def store_draft(self, draft: str, version_name: str):
         self.versions.append((version_name, draft))
@@ -74,267 +77,345 @@ class Memory:
 
 class LangChainClient:
     """
-    Обёртка вокруг LangChain, чтобы эмулировать метод generate_content(prompt).
-    Внутри создаёт LLMChain для каждого вызова.
+    Обёртка вокруг LangChain, упрощённо: для каждого generate_content делаем LLMChain и вызываем его.
     """
     @log_and_time
     def __init__(self):
-        # Инициируем чат-модель (можно заменить на Google PaLM, ChatGooglePalm и т.д.)
         self.llm = ChatGoogleGenerativeAI(
             model="gemini-1.5-flash",
             max_tokens=2000
         )
         logging.info("Инициализирован LangChainClient с ChatGoogleGenerativeAI.")
-
-        # ### Добавлено для подсчёта токенов ###
+        # Инициализируем токенизатор (примерно для подсчёта токенов)
         self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
         self.total_tokens_used = 0
         self.call_count = 0
-        # #####################################
 
     @log_and_time
     def generate_content(self, prompt: str) -> str:
-        """
-        Синхронно вызываем LLMChain, возвращаем строку с ответом.
-        """
-        # Создаём шаблон; для простоты используем весь prompt как единственный переменную {user_input}
         prompt_template = PromptTemplate(
             template="{user_input}",
             input_variables=["user_input"],
         )
-
         chain = LLMChain(
             llm=self.llm,
             prompt=prompt_template
         )
-        # Запускаем
         result = chain.run(user_input=prompt)
         logging.debug(f"Сгенерированный контент: {result}")
 
-        # ### Считаем и логируем расход токенов (приблизительно) ###
+        # Считаем токены (приблизительно)
         prompt_tokens = len(self.tokenizer.encode(prompt))
         result_tokens = len(self.tokenizer.encode(result))
         step_usage = prompt_tokens + result_tokens
-
         self.total_tokens_used += step_usage
         self.call_count += 1
+
         logging.info(
             f"Token usage for call {self.call_count}: "
             f"{step_usage} tokens (prompt: {prompt_tokens}, output: {result_tokens}). "
             f"Total so far: {self.total_tokens_used} tokens."
         )
-        # #########################################################
-
         return result
 
 class StudentAgent:
+    """
+    Псевдоним для "писателя" (AI-писатель).
+    """
     def __init__(self, llm_client: LangChainClient):
         self.llm_client = llm_client
         logging.info("Инициализирован StudentAgent.")
 
     @log_and_time
-    def produce_draft(self, plan: str, topic: str, constraints: str) -> str:
+    def produce_section_draft(self, section_title: str, topic: str, constraints: str) -> str:
+        """
+        Генерация черновика конкретной секции статьи.
+        """
         prompt = f"""
-Ты выступаешь в роли Студента, который пишет научную статью.
-Тема: {topic}
+Ты выступаешь в роли Студента (автора). 
+Тема статьи: {topic}
 Ограничения: {constraints}
-План (от преподавателя):
-{plan}
-Напиши черновик научной статьи, учитывая эту структуру:
-1) Введение (значимость и актуальность темы)
-2) Основная часть (теоретические и практические основы)
-3) Заключение (итог, выводы, решение проблемы)
-Ни в коем случае не нарушай ограничения, так как это приведет к ухудшению качества статьи.
+
+Название секции: {section_title}
+
+Напиши развёрнутый черновик текста для этой секции. 
+Помни об ограничениях и научном стиле.
 """
-        logging.info("Генерация первого черновика статьи.")
+        logging.info(f"Генерация черновика для секции: {section_title}")
         draft = self.llm_client.generate_content(prompt)
-        logging.info("Черновик статьи сгенерирован.")
+        logging.info("Черновик секции сгенерирован.")
         return draft
 
     @log_and_time
-    def rewrite_draft(self, plan: str, topic: str, constraints: str, current_text: str, feedback: str) -> str:
+    def rewrite_section_draft(self, section_title: str, topic: str, constraints: str, current_text: str, feedback: str) -> str:
+        """
+        Переписывает черновик секции с учётом замечаний критика.
+        """
         prompt = f"""
-            Ты студент, твоя предыдущая версия статьи:
-            {current_text}
-            
-            Ниже приведены замечания, которые необходимо учесть:
-            {feedback}
-            
-            План статьи:
-            {plan}
-            Тема: {topic}
-            Ограничения: {constraints}
-            
-            Перепиши статью, исправляя перечисленные проблемы.
-            А также ни в коем случае не нарушай ограничения, так как это приведет к ухудшению качества статьи.
-            """
-        logging.info("Переписывание черновика статьи с учётом замечаний.")
+Ты - Студент (автор). 
+Текущая версия секции "{section_title}":
+{current_text}
+
+Полученные замечания (критика):
+{feedback}
+
+Тема статьи: {topic}
+Ограничения: {constraints}
+
+Перепиши текст секции, устранив указанные проблемы.
+Сохрани общий смысл и стиль, не нарушай ограничения.
+"""
+        logging.info(f"Переписывание секции {section_title} с учётом критики.")
         new_draft = self.llm_client.generate_content(prompt)
-        logging.info("Переписанный черновик статьи сгенерирован.")
+        logging.info("Секция переписана с учётом замечаний.")
         return new_draft
 
 class CriticAgent:
+    """
+    Критик (AI-критик), анализирует предоставленный текст и даёт замечания.
+    """
     def __init__(self, llm_client: LangChainClient):
         self.llm_client = llm_client
         logging.info("Инициализирован CriticAgent.")
 
     @log_and_time
-    def criticize_draft(self, draft_text: str) -> str:
+    def criticize_section(self, draft_text: str, section_title: str) -> str:
         prompt = f"""
-Выступи в роли Критика. Ниже приводится черновик научной статьи:
+Выступаешь в роли Критика. 
+Секция статьи: {section_title}
+
+Ниже черновик текста секции:
 {draft_text}
-Укажи слабые стороны, неточности в фактах, логические несостыковки, методологические ошибки.
-Дай рекомендации, как улучшить статью, чтобы она соответствовала требованиям научного журнала.
+
+Укажи все слабые места, неточности, логические ошибки, стилистические проблемы.
+Дай конкретные рекомендации по улучшению, но без переписывания всей секции.
 """
-        logging.info("Критика черновика статьи.")
+        logging.info(f"Критика секции: {section_title}")
         critical_feedback = self.llm_client.generate_content(prompt)
-        logging.info("Критика статьи сгенерирована.")
+        logging.info("Сгенерирована критика текущего черновика.")
         return critical_feedback
 
 class SupervisorAgent:
+    """
+    Научный руководитель (AI), даёт общий план статьи в формате JSON.
+    """
     def __init__(self, llm_client: LangChainClient):
         self.llm_client = llm_client
         logging.info("Инициализирован SupervisorAgent.")
 
     @log_and_time
-    def give_plan(self, topic: str, count_word: str) -> str:
+    def give_plan(self, topic: str, count_word: str) -> dict:
+        """
+        Генерация высокого уровня плана статьи в формате JSON.
+        Пример ожидаемого JSON:
+        {
+          "plan_title": "Название плана",
+          "sections": [
+            {
+              "title": "Введение",
+              "summary": "2-3 предложения с описанием",
+              "recommended_word_count": 200
+            },
+            ...
+          ]
+        }
+        """
         prompt = f"""
-Представь, что ты научный руководитель. Составь план статьи для студента.
-Тема: {topic}
-Объём: {count_word} слов
+Ты - Научный руководитель. 
+Тема статьи: {topic}
+Примерный общий объём статьи: {count_word} слов.
 
-Структура плана: аннотация, введение, основная часть (теория + практика), заключение.
+Составь подробный план статьи. 
+Сначала определи, как распределить слова по секциям, чтобы суммарное количество слов примерно соответствовало {count_word}.
+
+Верни результат СТРОГО в формате JSON без дополнительных пояснений. 
+Формат должен быть таким (данные после ключа - для примера):
+
+{{
+  "plan_title": "Статья о ...",
+  "sections": [
+    {{
+      "title": "Введение",
+      "summary": "Краткое описание, 1-2 предложения",
+      "recommended_word_count": 200
+    }},
+    {{
+      "title": "Основная часть",
+      "summary": "Основные теоретические и практические аспекты ...",
+      "recommended_word_count": 600
+    }},
+    {{
+      "title": "Заключение",
+      "summary": "Выводы ...",
+      "recommended_word_count": 200
+    }}
+  ]
+}}
+Важно: Не добавляй никаких полей, кроме указанных выше. Не пиши текст вокруг JSON. Только сам JSON.
 """
-        logging.info("Создание плана статьи.")
-        plan = self.llm_client.generate_content(prompt)
-        logging.info("План статьи сгенерирован.")
-        return plan
+        logging.info("Генерация плана статьи в формате JSON.")
+        plan_json_str_unformatted = self.llm_client.generate_content(prompt)
+        plan_json_str = plan_json_str_unformatted.replace('```', '').replace('json', '')
+        logging.info('--'*20)
+        logging.info(f"Получен сырой JSON-план: {plan_json_str}")
+        logging.info('--'*20)
 
-    @log_and_time
-    def evaluate_draft(self, draft_text: str) -> str:
-        prompt = f"""
-Выступи в роли Научного руководителя. Вот черновик статьи:
-{draft_text}
-Дай оценку её структуре, содержанию и качеству. Укажи конкретные рекомендации по улучшению.
-"""
-        logging.info("Оценка черновика статьи.")
-        feedback = self.llm_client.generate_content(prompt)
-        logging.info("Оценка статьи сгенерирована.")
-        return feedback
+        # Парсим JSON в Python-словарь
+        try:
+            plan_dict = json.loads(plan_json_str)
+            return plan_dict
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка парсинга JSON-плана: {e}")
+            raise ValueError("LLM вернул невалидный JSON. Попробуйте повторить запрос.")
 
+############################################################
+# Orchestrator: основной класс, который управляет процессом
+############################################################
 class OrchestratorGemini:
     def __init__(self, google_api_key: str):
         os.environ["GOOGLE_API_KEY"] = google_api_key
-
-        # Создаём клиента LangChain
         self.llm_client = LangChainClient()
 
         self.supervisor = SupervisorAgent(self.llm_client)
         self.student = StudentAgent(self.llm_client)
         self.critic = CriticAgent(self.llm_client)
         self.memory = Memory()
+
         logging.info("OrchestratorGemini инициализирован.")
 
     @log_and_time
-    def multi_iter_workflow(self, topic: str, count_word: str, constraints: str, max_iterations=2):
-        logging.info("Начало многоитерационного рабочего процесса.")
-        plan = self.supervisor.give_plan(topic, count_word)
+    def run_workflow(self, topic: str, count_word: str, constraints: str, max_section_iterations=2):
+        """
+        Полный процесс:
+        1. Получение плана у SupervisorAgent (JSON)
+        2. Итерация по sections (название + summary + recommended_word_count)
+        3. Для каждой секции:
+           - Создать черновик
+           - Критика
+           - Переписать с учётом критики
+        4. Объединить финальные тексты секций в один текст
+        """
+        # 1) Генерируем общий план (JSON -> dict)
+        plan_dict = self.supervisor.give_plan(topic, count_word)
+        plan_title = plan_dict.get("plan_title", "Без названия")
+        sections = plan_dict.get("sections", [])
 
-        # 1. Первая версия черновика
-        draft_v1 = self.student.produce_draft(plan, topic, constraints)
-        self.memory.store_draft(draft_v1, "Draft_v1")
+        # Сохраняем исходный JSON-план в память (как строку, при желании)
+        plan_json_str = json.dumps(plan_dict, ensure_ascii=False, indent=2)
+        self.memory.store_draft(plan_json_str, "Plan_JSON")
 
-        # 2. Критика/оценка
-        critique_v1 = self.critic.criticize_draft(draft_v1)
-        supervisor_v1 = self.supervisor.evaluate_draft(draft_v1)
+        # 2) Проходимся по секциям
+        final_sections_texts = []
+        for idx, sec in enumerate(sections, start=1):
+            section_title = sec["title"]
+            # Можно при желании использовать sec["summary"], sec["recommended_word_count"] и т.д.
 
-        combined_feedback_v1 = critique_v1 + "\n\n" + supervisor_v1
-        self.memory.store_feedback(combined_feedback_v1, "Critic+Supervisor")
+            logging.info(f"Начинаем работу над секцией {idx}: {section_title}")
 
-        # Итерационный процесс
-        for i in range(1, max_iterations):
-            logging.info(f"Итерация {i + 1} начата.")
-            new_draft = self.student.rewrite_draft(
-                plan=plan,
+            # Генерируем черновик
+            draft = self.student.produce_section_draft(
+                section_title=section_title,
                 topic=topic,
-                constraints=constraints,
-                current_text=self.memory.get_last_draft(),
-                feedback=combined_feedback_v1
+                constraints=constraints
             )
-            version_name = f"Draft_v{i + 1}"
-            self.memory.store_draft(new_draft, version_name)
+            version_name = f"Section_{idx}_Draft_v1"
+            self.memory.store_draft(draft, version_name)
 
-            new_critique = self.critic.criticize_draft(new_draft)
-            new_supervisor = self.supervisor.evaluate_draft(new_draft)
+            # Итерационный цикл для секции
+            current_draft = draft
+            for it in range(1, max_section_iterations+1):
+                criticism = self.critic.criticize_section(current_draft, section_title)
+                self.memory.store_feedback(criticism, f"Critic_Section_{idx}_Iteration_{it}")
 
-            combined_feedback_v1 = new_critique + "\n\n" + new_supervisor
-            self.memory.store_feedback(combined_feedback_v1, "Critic+Supervisor")
-            logging.info(f"Итерация {i + 1} завершена.")
+                new_draft = self.student.rewrite_section_draft(
+                    section_title=section_title,
+                    topic=topic,
+                    constraints=constraints,
+                    current_text=current_draft,
+                    feedback=criticism
+                )
+                version_name = f"Section_{idx}_Draft_v{it+1}"
+                self.memory.store_draft(new_draft, version_name)
+                current_draft = new_draft
 
-        logging.info("Многоитерационный рабочий процесс завершён.")
+            # Сохраняем итоговый вариант секции
+            final_sections_texts.append(f"## {section_title}\n{current_draft}")
 
-        # ### Логируем общее количество токенов ###
+        # 4) Склеиваем секции
+        final_text = f"# {plan_title}\n\n" + "\n\n".join(final_sections_texts)
+
+        # Подсчёт токенов
         total_usage = self.llm_client.total_tokens_used
-        logging.info(f"Общее число (приблизительное) использованных токенов: {total_usage}")
-        # ##########################################
+        logging.info(f"Общее число использованных токенов (приблизительно): {total_usage}")
 
         return {
-            "plan": plan,
+            "plan_dict": plan_dict,
             "all_versions": self.memory.versions,
-            "final_version": self.memory.get_last_draft(),
+            "final_text": final_text,
             "feedback_history": self.memory.feedback,
-            "tokens_used_approx": total_usage  # <-- по желанию возвращаем в ответ
+            "tokens_used_approx": total_usage
         }
 
 # Асинхронная обёртка
 async def main():
     try:
         logging.info("Запуск главной функции.")
-        google_api_key = init_project()  # грузим ключ из .env или ещё откуда-то
+        google_api_key = init_project()
         orchestrator = OrchestratorGemini(google_api_key)
 
         topic = "Проблема дифференциации виновного и безвиновного деяния в гражданском праве"
         count_word = "1000"
-        constraints = "Строгая формальная лексика, упоминание реальных исследований, максимальное отклонение от заданного количества слов - 50"
+        constraints = "Строгая формальная лексика, упоминание реальных исследований, отклонение от заданного объёма не более 50 слов"
 
         start_time = time.time()
-        results = orchestrator.multi_iter_workflow(topic, count_word, constraints, max_iterations=2)
+        results = orchestrator.run_workflow(
+            topic=topic,
+            count_word=count_word,
+            constraints=constraints,
+            max_section_iterations=2
+        )
         end_time = time.time()
         elapsed = end_time - start_time
         logging.info(f"Рабочий процесс завершён за {elapsed:.2f} секунд.")
 
-        # 1) Формируем содержимое для файла
+        # Формируем содержимое Markdown-файла
         md_content = []
         md_content.append("# Итоги генерации научной статьи\n")
-        md_content.append(f"**Тема**: {topic}\n")
-        md_content.append(f"**План**:\n\n{results['plan']}\n")
 
+        # Сам JSON-план
+        md_content.append("## Исходный JSON-план\n")
+        plan_json_str = json.dumps(results["plan_dict"], ensure_ascii=False, indent=2)
+        md_content.append(f"```json\n{plan_json_str}\n```\n")
+
+        # Все версии черновиков
         md_content.append("## Все версии черновиков\n")
         for version_name, draft_text in results["all_versions"]:
             md_content.append(f"### {version_name}\n")
             md_content.append(f"{draft_text}\n")
 
-        md_content.append("## Итоговая версия\n")
-        md_content.append(results["final_version"])
+        # Итоговый текст
+        md_content.append("## Итоговый текст\n")
+        md_content.append(results["final_text"])
 
+        # История замечаний
         md_content.append("\n## История замечаний\n")
         for role, feedback_text in results["feedback_history"]:
             md_content.append(f"### {role}\n")
             md_content.append(f"{feedback_text}\n")
 
-        # Добавляем информацию о токенах
+        # Подсчёт токенов
         md_content.append("\n## Счётчик использованных токенов (приблизительно)\n")
         md_content.append(f"Итого использовано ~{results['tokens_used_approx']} токенов.\n")
 
-        # 2) Сохраняем всё в Markdown-файл
+        # Сохраняем
         output_filename = "article_results.md"
         with open(output_filename, "w", encoding="utf-8") as f:
             f.write("\n".join(md_content))
 
         logging.info(f"Результаты записаны в файл: {output_filename}")
 
-    except Exception == 'ValueError' as e:
-        logging.exception("Произошла непредвиденная ошибка в главной функции.")
+    except Exception as e:
+        logging.exception("Произошла ошибка в main().")
 
 if __name__ == '__main__':
     asyncio.run(main())
